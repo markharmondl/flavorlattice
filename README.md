@@ -44,6 +44,57 @@ Pairing quality is bounded by the compound-profile data, not the code.
 - **VCF** (Volatile Compounds in Food, TNO) — commercial/paywalled gold standard
   for quantitative volatiles. Upgrade path, not a v0 dependency.
 
+### How data gets in: two planes, one write barrier
+
+The bulk sources above are structured, stable-schema and few, so they get plain
+deterministic ETL (`data/ingest.py`). **No model in that loop** — a hand-written
+adapter beats an agent on cost, speed, reproducibility and diffability, and at
+N≈5 sources adapter-writing amortizes fine. Agentic ingestion earns its cost
+when the source set is large and heterogeneous enough that adapters don't.
+
+The **cooking-method transform data is the exception**, and it's the one place a
+model earns its keep. No database has it; it's scattered across individual
+GC-MS papers with inconsistent table layout, units, and internal standards, with
+the treatment often encoded only in a column header. That's genuine per-document
+reasoning over unstructured input.
+
+```
+  BULK PLANE     download -> parse -> validate -> canonical        (no model)
+
+  LONG-TAIL      search/fetch/dedupe  (deterministic)
+  PLANE            -> extract         (LLM, one document at a time)
+                   -> staging table
+                   -> resolve         (deterministic, PubChem)
+                   -> validate        (deterministic, physical checks)
+                   -> canonical
+```
+
+Three rules the code enforces:
+
+1. **An LLM may write to staging; never to canonical.** `data/staging.py` is the
+   barrier. Promotion is a deterministic job.
+2. **Identity resolution is never inferred.** The model emits the compound name
+   *as printed*; `data/resolve.py` resolves it against PubChem and refuses
+   ambiguous hits rather than taking the first. An LLM-assigned CID that merges
+   (Z)- and (E)-3-hexen-1-ol poisons every downstream score in a way you will
+   not catch by inspection.
+3. **Validation is physical, not confidence-based.** `data/validate.py` checks
+   retention indices against class windows, concentrations against sample mass,
+   ranges for inversion, and — the useful one — large Maillard-product gains
+   under wet methods, which is the signature of a shifted method-to-column
+   mapping. Model-reported confidence is uncalibrated on table extraction; a
+   model reading the wrong column is confident and wrong.
+
+Rejected records are **retained with their reasons**. That set is the eval
+harness: when you change the extraction prompt or model, the metric is how many
+previously-rejected records now pass, and how many previously-passing now fail.
+`StagingStore.rejection_report()` ranks failure codes — the top one is almost
+always a systematic prompt bug, not a hard case.
+
+Run extraction on a **cheap API model, not the local 8GB box**. It's a one-time
+batch backfill whose accuracy propagates into every score; that's a different
+budget from the latency-sensitive interactive path.
+
 ### Cooking-method aroma changes
 
 There is no clean public dataset of "compound delta by cooking method" — the
@@ -63,18 +114,21 @@ compound families rather than trying to look it up:
 
 This v0 operator is intentionally legible and is the first thing to replace with
 a learned model once you have paired raw/cooked GC-MS data.
+`LearnedCookingTransform` implements the same interface and drops in behind it.
 
 ## Components
 
 ```
 flavorpair/
-  data/     schema (dataclasses), FlavorDB2/FooDB/Flavornet ingest, DuckDB store
-  engine/   vectorize (OAV/binary) -> pairing (shared / cosine / novelty)
+  data/     schema (dataclasses), DuckDB store, bulk ingest adapters,
+            + resolve (PubChem, deterministic) / extract (LLM, literature)
+            / staging (write barrier) / validate (physical checks) / fixtures
+  engine/   vectorize (OAV/binary) -> pairing (harmony / novelty)
             + cooking transforms.  PURE MATH, no LLM, no network.
   models/   router (local vs API), local LLM (Ollama/llama.cpp),
             API LLM (DeepSeek/Qwen/Mistral), embeddings + YOUR models
   agent/    tools (deterministic wrappers) + orchestrator (LLM tool-call loop)
-  cli.py    pair / partners / profile / chat  (chat = the "chat channel")
+  cli.py    pair / partners / profile / coverage / chat
 ```
 
 Data flow for a chat turn: message → **PARSE** (local LLM → tool calls) →
@@ -87,6 +141,7 @@ execute tools (engine) → **EXPLAIN** (router picks local or API → prose).
 | PARSE (message → query) | local | short, schema-constrained, hot path |
 | RESOLVE (fuzzy name → id) | local + embeddings (CPU) | cheap, high volume |
 | EXPLAIN (narrate results) | local, → API when large | quality where it shows |
+| EXTRACT (GC-MS papers) | **API, batch** | accuracy propagates; off the latency path |
 | pairing / cooking | **no model** | deterministic engine |
 
 - **Local:** Qwen2.5-**3B**-Instruct Q4_K_M (~2GB) is the recommended default —
@@ -95,9 +150,10 @@ execute tools (engine) → **EXPLAIN** (router picks local or API → prose).
   cache) fits an 8GB card but is tight; use it if you want a stronger parser and
   aren't training alongside it. Run the embedding model (bge-small, ~130MB) on
   CPU either way.
-- **API (cheap, for EXPLAIN/overflow):** DeepSeek-V3 (`deepseek-chat`) is the
-  low-cost default; Qwen (DashScope) and Mistral (`mistral-small`) are
-  drop-in via the same OpenAI-compatible client. Keys from env vars.
+- **API (cheap, for EXPLAIN/overflow and EXTRACT):** DeepSeek-V3
+  (`deepseek-chat`) is the low-cost default; Qwen (DashScope) and Mistral
+  (`mistral-small`) are drop-in via the same OpenAI-compatible client. Keys from
+  env vars.
 - The router is the same shape as the coding-agent harness — reuse it.
 
 ## Where your own models slot in (`models/embeddings.py`)
@@ -112,30 +168,70 @@ execute tools (engine) → **EXPLAIN** (router picks local or API → prose).
    RecipeDB process labels. Same signature as `engine.cooking.apply_cooking`, so
    it drops in behind the interface.
 4. **Calibration layer** — proper scoring rules turning raw scores into
-   calibrated pairing probabilities (ties to your scoring-rule work).
+   calibrated pairing probabilities (ties to your scoring-rule work). Also the
+   right home for extraction confidence, if you attach any: calibrate it against
+   validation outcomes rather than reporting a raw model number.
 
 ## Quick start
 
 ```bash
-pip install -e .                    # base deps only
-python -m pytest tests/ -q          # runs the engine smoke test, no data needed
+pip install -e ".[dev]"
+python -m pytest tests/ -q          # 33 tests, no data or network needed
 
-# after wiring an ingest source + a local model:
-flavorpair partners cauliflower --mode harmony --method roast
-flavorpair pair strawberry basil
-flavorpair chat
+# works immediately against the built-in fixture set:
+python -m flavorpair.cli pair strawberry basil
+python -m flavorpair.cli partners peach --mode novelty --limit 5
+python -m flavorpair.cli profile hazelnut --method roast
+
+# after an ingest:
+python -m flavorpair.cli --store data_store/flavorpair.duckdb coverage
+python -m flavorpair.cli chat       # needs a local or API model
 ```
+
+`data/fixtures.py` is ~13 real compounds across 6 ingredients so every command
+runs before any ingest. It is **not** reference data — don't tune against it.
 
 ## Build order (suggested)
 
-1. `data/ingest_flavordb.py` + `store.py` — get real profiles in DuckDB.
-2. Validate `engine/pairing.py` against the Barabási cuisine trends.
-3. Enrich with FooDB concentrations → turn on OAV weighting.
+1. `data/ingest.py::ingest_flavordb2` + `store.py` — get real profiles in DuckDB.
+   Check `coverage()` afterward; `pct_with_threshold` decides whether OAV
+   weighting is usable at all.
+2. Validate `engine/pairing.py` against the Barabási cuisine trends — positive
+   shared-compound affinity for Western recipes, negative for East Asian. If it
+   doesn't reproduce, something is wrong in vectorize or pairing, and you want
+   to know that before you have opinions about strawberry and basil.
+3. Enrich with FooDB concentrations → turn on OAV weighting. Experimental values
+   only; predicted ones will wreck OAV in a way that's hard to notice.
 4. Wire the local model for PARSE; the engine already answers headless.
-5. Calibrate `engine/cooking.py` against a few GC-MS papers, then train the
+5. Stand up the literature pipeline: `extract.py` → staging → `resolve.py` →
+   `promote()`. Work down `rejection_report()` before scaling the crawl.
+6. Calibrate `engine/cooking.py` against a few GC-MS papers, then train the
    learned transform on RecipeDB process labels.
-6. Add your embedding/GNN re-ranker behind the `PairingModel` interface.
+7. Add your embedding/GNN re-ranker behind the `PairingModel` interface.
 
-Status: engine core is implemented and tested; ingest, store, and LLM clients
-are documented stubs (`NotImplementedError` with the exact wiring in the
-docstring).
+## Status
+
+**Implemented and tested** (33 passing): the whole `engine/` (vectorize,
+pairing, cooking), the DuckDB store, the staging tier, the validation gate,
+promotion, unit conversion, extraction-response parsing, the agent toolbox, and
+the CLI.
+
+**Documented stubs** (`NotImplementedError` with the exact wiring in the
+docstring): the five bulk ingest adapters, `extract.extract_document`, the local
+LLM clients, and the learned models. Every stub raises rather than silently
+falling back — a learned transform that quietly returns the rule-based output is
+worse than none, because you can't tell which produced a result.
+
+## Known calibration gaps
+
+- The cooking operators' **relative** magnitudes are unvalidated. On the
+  fixtures, roasting hazelnut currently grows the lipid aldehydes slightly
+  faster than the pyrazines; real roasted hazelnut is pyrazine-led. The
+  aldehyde gain coefficients in `cooking.py` are the knob. This is step 6.
+- The **novelty axis is compressed** on small data (all candidates land near
+  0.4 on the six fixture ingredients). Re-check its spread once real profiles
+  are loaded; if it stays flat, the anchor-saturation constant (`3.0` in
+  `score_pair`) is the thing to tune.
+- Class-median fallback thresholds in `vectorize.py` are order-of-magnitude
+  estimates. They only matter for compounds FlavorDB2 has no threshold for —
+  watch `pct_with_threshold`.
